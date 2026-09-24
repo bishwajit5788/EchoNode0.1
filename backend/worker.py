@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import hmac
 from pathlib import Path
 
 # Add backend directory to sys.path so modules import cleanly
@@ -18,6 +19,14 @@ from app.api.routes import router, is_cookie_configured, is_po_token_provider_co
 logger = logging.getLogger("echonode.worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+WORKER_TOKEN_ENV = "ECHONODE_WORKER_TOKEN"
+WORKER_TOKEN_HEADER = "X-EchoNode-Worker-Token"
+
+
+def worker_token_configured() -> bool:
+    return bool(os.environ.get(WORKER_TOKEN_ENV, "").strip())
+
+
 worker_app = FastAPI(
     title="EchoNode Extraction Worker",
     version=settings.version,
@@ -32,6 +41,26 @@ async def worker_http_exception_handler(request: Request, exc: HTTPException):
         content={"error": msg, "detail": msg},
         headers=exc.headers
     )
+
+@worker_app.middleware("http")
+async def worker_auth_middleware(request: Request, call_next):
+    # Keep health public so uptime/tunnel checks can verify liveness.
+    # Every operational API route is fail-closed behind the shared worker token.
+    if request.url.path.startswith("/api/"):
+        expected = os.environ.get(WORKER_TOKEN_ENV, "").strip()
+        provided = request.headers.get(WORKER_TOKEN_HEADER, "")
+        if not expected:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "Worker authentication is not configured"},
+            )
+        if not provided or not hmac.compare_digest(provided, expected):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Worker authentication required"},
+                headers={"WWW-Authenticate": "WorkerToken"},
+            )
+    return await call_next(request)
 
 worker_app.add_middleware(
     CORSMiddleware,
@@ -86,7 +115,8 @@ async def health_check():
         "storage_backend": os.environ.get("STORAGE_BACKEND", "local"),
         "youtube_cookie_configured": is_cookie_configured(),
         "youtube_po_token_provider_configured": is_po_token_provider_configured(),
-        "yt_dlp_version": yt_dlp_v
+        "yt_dlp_version": yt_dlp_v,
+        "worker_auth_configured": worker_token_configured()
     }
 
 def main():
