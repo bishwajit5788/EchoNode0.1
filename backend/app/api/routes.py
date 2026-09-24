@@ -7,7 +7,7 @@ import urllib.error
 from pathlib import Path
 from typing import List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
-from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse, StreamingResponse
 
 from ..config import settings
 from ..models import (
@@ -24,9 +24,18 @@ from ..services.storage import storage_service
 
 router = APIRouter(prefix="/api", tags=["EchoNode Audio Engine"])
 
+WORKER_TOKEN_ENV = "ECHONODE_WORKER_TOKEN"
+WORKER_TOKEN_HEADER = "X-EchoNode-Worker-Token"
+
+
 def get_worker_url() -> str:
     """Dynamically get configured worker URL from environment."""
     return os.environ.get("WORKER_URL", "").strip().rstrip("/")
+
+
+def get_worker_token() -> str:
+    """Get the shared secret used for Vercel -> worker authentication."""
+    return os.environ.get(WORKER_TOKEN_ENV, "").strip()
 
 def is_cookie_configured() -> bool:
     """Return whether YouTube authentication cookies are present."""
@@ -59,9 +68,16 @@ def check_worker_health(timeout: float = 2.0) -> Tuple[bool, Optional[dict]]:
     if not worker_url:
         return False, None
     try:
+        token = get_worker_token()
+        if not token:
+            return False, None
         req = urllib.request.Request(
             f"{worker_url}/health",
-            headers={"Accept": "application/json", "User-Agent": "EchoNode-API/1.1.0"},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "EchoNode-API/1.1.0",
+                WORKER_TOKEN_HEADER: token,
+            },
             method="GET"
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -79,7 +95,13 @@ def proxy_to_worker(method: str, path: str, payload: Optional[dict] = None) -> d
         raise HTTPException(status_code=503, detail="Extraction worker is not configured")
 
     target_url = f"{worker_url}{path}"
-    headers = {"Content-Type": "application/json"}
+    token = get_worker_token()
+    if not token:
+        raise HTTPException(status_code=503, detail="Worker authentication secret is not configured")
+    headers = {
+        "Content-Type": "application/json",
+        WORKER_TOKEN_HEADER: token,
+    }
     data = json.dumps(payload).encode("utf-8") if payload else None
 
     req = urllib.request.Request(target_url, data=data, headers=headers, method=method)
