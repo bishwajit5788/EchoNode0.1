@@ -209,8 +209,57 @@ async def download_file(filename: str):
     worker_url = get_worker_url()
 
     if worker_url:
+        token = get_worker_token()
+        if not token:
+            raise HTTPException(status_code=503, detail="Worker authentication secret is not configured")
+
         worker_download = f"{worker_url}/api/download/{urllib.parse.quote(unquoted_name)}"
-        return RedirectResponse(url=worker_download)
+        req = urllib.request.Request(
+            worker_download,
+            headers={
+                WORKER_TOKEN_HEADER: token,
+                "Accept": "audio/mp4, audio/mpeg, application/octet-stream",
+                "User-Agent": "EchoNode-API/1.1.0",
+            },
+            method="GET",
+        )
+        try:
+            upstream = urllib.request.urlopen(req, timeout=120)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            try:
+                err_json = json.loads(err_body)
+                detail = err_json.get("detail", err_json.get("error", err_json.get("message", str(e))))
+            except Exception:
+                detail = err_body or str(e)
+            raise HTTPException(status_code=e.code, detail=sanitize_error_message(detail))
+        except urllib.error.URLError as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Persistent extraction worker is currently unreachable: {sanitize_error_message(str(e.reason))}"
+            )
+
+        media_type = upstream.headers.get_content_type() or (
+            "audio/mp4" if Path(unquoted_name).suffix.lower() == ".m4a" else "audio/mpeg"
+        )
+        response_headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(Path(unquoted_name).name)}"
+        }
+        content_length = upstream.headers.get("Content-Length")
+        if content_length:
+            response_headers["Content-Length"] = content_length
+
+        def stream_worker_file():
+            try:
+                while True:
+                    chunk = upstream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                upstream.close()
+
+        return StreamingResponse(stream_worker_file(), media_type=media_type, headers=response_headers)
 
     local_path = storage_service.get_file_path(unquoted_name)
     if local_path and local_path.exists():
